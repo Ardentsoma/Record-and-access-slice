@@ -1,0 +1,178 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // The app connects as a non-owner role so the RLS policies on `briefs` and
+  // `brief_assets` actually apply to it. See ADMIN_DATABASE_URL in .env.
+  url = env("DATABASE_URL")
+  // Migrations and Prisma Studio use the owner role, which is exempt from RLS.
+  directUrl = env("ADMIN_DATABASE_URL")
+}
+
+/// One registered user. email is globally unique so two accounts can never
+/// share a login (also what makes signup idempotent at the DB level).
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  passwordHash String
+  fullName  String
+  emailVerifiedAt DateTime?
+  /// Tracks when the last verification code was emailed so resend is limited
+  /// to a server-side cooldown window, independent of any client countdown.
+  emailVerificationLastSentAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions               Session[]
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens    PasswordResetToken[]
+  briefs                 Brief[]
+  briefAssets            BriefAsset[]
+  auditLogs              AuditLog[]
+}
+
+/// A brief uploaded by a user: a title they chose, plus the documents they
+/// attached. Nothing is worked out or added automatically — there is no
+/// summary, no outline, no status.
+///
+/// Who is allowed to see a brief is checked twice, independently, so that one
+/// mistake on its own can't cause a leak:
+///  1. In the app: every question this slice asks about a brief also asks
+///     "whose is this?", in the same breath. See src/lib/briefs/service.ts.
+///  2. In the database: a rule on this table says a row can only be seen by
+///     whoever is currently asking, and the app says who that is at the start
+///     of each piece of work. See the briefs_rls migration.
+///
+/// The second one only works because the app signs in with a database account
+/// that owns nothing. Postgres lets whoever owns a table skip its own rules,
+/// so an app signed in as the owner would quietly ignore the rule above. The
+/// app checks it has the right account before serving anything — see
+/// src/lib/db-role.ts. Prisma Studio and migrations use the owner account on
+/// purpose, which is why they can see every brief.
+///
+/// There is deliberately no `deletedAt`: deletes are hard deletes.
+model Brief {
+  id       String @id @default(cuid())
+  publicId String @unique @default(dbgenerated("(gen_random_uuid())::text"))
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([userId, title])
+
+  assets            BriefAsset[]
+
+  @@map("briefs")
+}
+
+/// A file attached to a brief (PDF, JPG or PNG).
+///
+/// Same two-layer ownership enforcement as Brief: every query filters on
+/// `userId`, and the `brief_assets_owner_isolation` RLS policy backs it up at
+/// the database. `userId` is denormalised onto the asset precisely so an asset
+/// can be authorised without first joining through to its brief — otherwise a
+/// lookup by asset id alone would be a cross-user read waiting to happen.
+///
+/// `storageKey` is server-generated (`<userId>/<assetPublicId>`) and never
+/// contains any user-supplied text, so a hostile filename cannot influence an
+/// object path. The original name is kept in `fileName` for display only.
+model BriefAsset {
+  id        String @id @default(cuid())
+  publicId  String @unique @default(dbgenerated("(gen_random_uuid())::text"))
+  briefId   String
+  brief     Brief  @relation(fields: [briefId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  fileName      String
+  contentType   String
+  fileSizeBytes Int
+  storageKey    String   @unique
+
+  /// The file body itself, stored in Postgres.
+  ///
+  /// Nullable only so the migration could not fail against a database that
+  /// already held rows written when bytes lived in object storage. Every read
+  /// path treats NULL as "no bytes" and answers 404, and every new row writes
+  /// its bytes in the same INSERT as its metadata, so this is never partial.
+  content Bytes?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([briefId])
+  @@map("brief_assets")
+}
+
+/// A server-side session row. The browser only ever holds a random id that
+/// references this row, so sessions can be revoked/expired centrally.
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+/// A 6-digit email verification code. `codeHash` is what verification is
+/// checked against (never compared in plaintext); the raw `code` is also kept
+/// so the currently issued token is inspectable directly in the database /
+/// Prisma Studio during development. Rows die once used or past expiresAt.
+model EmailVerificationToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  code      String
+  codeHash  String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+/// A password reset token. Only the sha-256 hash is stored with an expiry and
+/// a one-shot flag, so a leaked DB cannot be used to mint reset links.
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+/// A log of actions worth remembering later, kept in the database so it can't
+/// be quietly edited or deleted by the app — there is no update or delete
+/// path for it.
+///
+/// Nothing in the app writes to this table yet. It exists because a brand new
+/// database built from the migrations has to match the schema, and the
+/// reconcile_missing_objects migration creates it. Don't read anything into
+/// the empty table; there is no soft delete or admin trail in this slice.
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  action     String
+  entityType String
+  entityId   String
+  snapshot   Json
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([entityType, entityId])
+}
