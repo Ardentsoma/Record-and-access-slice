@@ -29,8 +29,7 @@ returns 401 before touching the database.
 3. Start or create a PostgreSQL database with an **owner** role. The bundled
    `docker-compose.yml` does this: `docker compose up -d` creates the database
    `scope_briefs` owned by the login `scope`.
-4. Create the **application** role yourself. This step is deliberately not a
-   migration, so that no password ever lands in version control:
+4. Create the **application** role yourself.
 
    ```sql
    CREATE ROLE scope_app LOGIN PASSWORD '<generated>' NOSUPERUSER NOBYPASSRLS;
@@ -64,12 +63,6 @@ returns 401 before touching the database.
    until `emailVerifiedAt` is set, so you cannot reach `/dashboard` without
    doing this first.
 9. Visit `http://localhost:3000/dashboard`.
-
-`.env.example` in the repository root documents the variables above, with
-example values rather than commented-out placeholders. It does **not**
-mention `DATABASE_APP_ROLE`; that override is read from the environment but
-has no entry in the example file. No real credentials are committed — `.env`
-is gitignored and only `.env.example` is tracked.
 
 ## Section 3: The Flow, Step By Step
 
